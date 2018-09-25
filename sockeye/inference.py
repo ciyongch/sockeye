@@ -24,6 +24,7 @@ from functools import lru_cache, partial
 from typing import Callable, Dict, Generator, List, NamedTuple, Optional, Tuple, Union, Set
 
 import mxnet as mx
+from mxnet.contrib.quantization import *
 import numpy as np
 
 from . import constants as C
@@ -36,6 +37,94 @@ from . import vocab
 from .log import is_python34
 
 logger = logging.getLogger(__name__)
+
+
+class Quantize(object):
+    def __init__(self,
+                 params,
+                 aux_params,
+                 excluded_sym_names=None,
+                 dtype='int8',
+                 logger=logger) -> None:
+        self.params = params
+        self.aux_params = aux_params
+        self.dtype = dtype
+        self.logger = logger
+
+        self.excluded_encoder_sym_names = []
+        self.excluded_decoder_sym_names = []
+        for name in excluded_sym_names:
+            if name.find('encoder') != -1:
+                self.excluded_encoder_sym_names.append(name)
+            else:
+                # logits (FC) is located at decoder
+                self.excluded_decoder_sym_names.append(name)
+
+    def save_symbol(self, fname, sym, logger=None) -> None:
+        if logger is not None:
+            logger.info('Saving symbol into file at %s' % fname)
+        sym.save(fname)
+
+    def save_params(self, fname, params, aux_params, logger=None) -> None:
+        if logger is not None:
+            logger.info('Saving params into file at %s' % fname)
+        save_dict = {('arg:%s' % k): v.as_in_context(cpu()) for k, v in params.items()}
+        save_dict.update({('aux:%s' % k): v.as_in_context(cpu()) for k, v in aux_params.items()})
+        mx.nd.save(fname, save_dict)
+
+    def q_model(self, sym, module='encoder', bucket_key=None):
+        excluded_sym_names = None
+        excluded_syms = []
+
+        sym_file_name = '%s' % (module + '_quantized_')
+
+        if module is 'encoder':
+            if self.excluded_encoder_sym_names is None:
+                self.excluded_encoder_sym_name = []
+
+            if not isinstance(self.excluded_encoder_sym_names, list):
+                raise ValueError('excluded_encoder_sym_names must be a list of strings representing'
+                                 ' the names of the symbols that will not be quantized,'
+                                 ' while received type %s' % str(type(self.excluded_encoder_sym_names)))
+            excluded_sym_names = self.excluded_encoder_sym_names
+
+            sym_file_name = '%s_symbol.json' % (sym_file_name + (str(bucket_key) if
+                                                    isinstance(bucket_key, int) else ''))
+
+        if module is 'decoder':
+            if self.excluded_decoder_sym_names is None:
+                self.excluded_decoder_sym_name = []
+
+            if not isinstance(self.excluded_decoder_sym_names, list):
+                raise ValueError('excluded_decoder_sym_names must be a list of strings representing'
+                                 ' the names of the symbols that will not be quantized,'
+                                 ' while received type %s' % str(type(self.excluded_decoder_sym_names)))
+            excluded_sym_names = self.excluded_decoder_sym_names
+
+            sym_file_name = '%s_symbol.json' % (sym_file_name + ('-'.join(str(i) for i in bucket_key)
+                                                    if isinstance(bucket_key, tuple) else ''))
+
+        if excluded_sym_names is not None:
+            nodes = sym.get_internals()
+            full_outputs = nodes.list_outputs()
+            for sym_name in excluded_sym_names:
+                idx = full_outputs.index(sym_name + '_output')
+                excluded_syms.append(nodes[idx])
+        self.logger.info('Quantizing symbol')
+
+        if self.dtype != 'int8' and self.dtype != 'uint8':
+            raise ValueError('unknown quantized_dtype %s received,'
+                             ' expected `int8` or `uint8`' % self.dtype)
+        qsym = quantize_symbol(sym, excluded_symbols=excluded_syms,
+                               offline_params=list(self.params.keys()),
+                               quantized_dtype=self.dtype)
+
+        self.save_symbol(sym_file_name, qsym, self.logger)
+        return qsym
+
+    def q_params(self, qsym, params):
+        self.logger.info('Quantizing params')
+        return quantize_params(qsym, params)
 
 
 class InferenceModel(model.SockeyeModel):
@@ -89,6 +178,7 @@ class InferenceModel(model.SockeyeModel):
         self.cache_output_layer_w_b = cache_output_layer_w_b
         self.output_layer_w = None  # type: Optional[mx.nd.NDArray]
         self.output_layer_b = None  # type: Optional[mx.nd.NDArray]
+        self.quantize = None
 
     @property
     def num_source_factors(self) -> int:
@@ -124,6 +214,23 @@ class InferenceModel(model.SockeyeModel):
                                   "ratio observed during training." % (self.max_supported_seq_len_target,
                                                                        decoder_max_len))
 
+        self.load_params_from_file(self.params_fname)
+        excluded_sym_names = ["encoder_birnn_forward_l0_t0_h2h",
+                              "encoder_birnn_reverse_l0_t0_h2h",
+                              "encoder_rnn_l0_t0_h2h",
+                              "encoder_rnn_l1_t0_h2h",
+                              "encoder_rnn_l2_t0_h2h",
+                              "encoder_rnn_l3_t0_h2h",
+                              "encoder_rnn_l4_t0_h2h",
+                              "encoder_rnn_l5_t0_h2h",
+                              "encoder_rnn_l6_t0_h2h",
+                              "logits",
+                              ]
+        self.quantize = Quantize(self.params, self.aux_params,
+                                 excluded_sym_names=excluded_sym_names,
+                                 dtype='int8',
+                                 logger=logger)
+
         self.encoder_module, self.encoder_default_bucket_key = self._get_encoder_module()
         self.decoder_module, self.decoder_default_bucket_key = self._get_decoder_module()
 
@@ -132,9 +239,11 @@ class InferenceModel(model.SockeyeModel):
         self.encoder_module.bind(data_shapes=max_encoder_data_shapes, for_training=False, grad_req="null")
         self.decoder_module.bind(data_shapes=max_decoder_data_shapes, for_training=False, grad_req="null")
 
-        self.load_params_from_file(self.params_fname)
-        self.encoder_module.init_params(arg_params=self.params, aux_params=self.aux_params, allow_missing=False)
-        self.decoder_module.init_params(arg_params=self.params, aux_params=self.aux_params, allow_missing=False)
+        encoder_params = self.quantize.q_params(self.encoder_module.symbol, self.params)
+        decoder_params = self.quantize.q_params(self.decoder_module.symbol, self.params)
+
+        self.encoder_module.init_params(arg_params=encoder_params, aux_params=self.aux_params, allow_missing=False)
+        self.decoder_module.init_params(arg_params=decoder_params, aux_params=self.aux_params, allow_missing=False)
 
         if self.cache_output_layer_w_b:
             if self.output_layer.weight_normalization:
@@ -155,7 +264,6 @@ class InferenceModel(model.SockeyeModel):
 
         :return: Tuple of encoder module and default bucket key.
         """
-
         def sym_gen(source_seq_len: int):
             source = mx.sym.Variable(C.SOURCE_NAME)
             source_words = source.split(num_outputs=self.num_source_factors, axis=2, squeeze_axis=True)[0]
@@ -181,7 +289,10 @@ class InferenceModel(model.SockeyeModel):
 
             data_names = [C.SOURCE_NAME]
             label_names = []  # type: List[str]
-            return mx.sym.Group(decoder_init_states), data_names, label_names
+            qsym = self.quantize.q_model(sym=mx.sym.Group(decoder_init_states),
+                                         module='encoder',
+                                         bucket_key=source_seq_len)
+            return qsym, data_names, label_names
 
         default_bucket_key = self.max_input_length
         module = mx.mod.BucketingModule(sym_gen=sym_gen,
@@ -200,7 +311,6 @@ class InferenceModel(model.SockeyeModel):
 
         :return: Tuple of decoder module and default bucket key.
         """
-
         def sym_gen(bucket_key: Tuple[int, int]):
             """
             Returns either softmax output (probs over target vocabulary) or inputs to logit
@@ -240,7 +350,11 @@ class InferenceModel(model.SockeyeModel):
 
             data_names = [C.TARGET_NAME] + state_names
             label_names = []  # type: List[str]
-            return mx.sym.Group([outputs, attention_probs] + states), data_names, label_names
+
+            qsym = mx.sym.Group([outputs, attention_probs] + states)
+            qsym = self.quantize.q_model(sym=mx.sym.Group([outputs, attention_probs] + states),
+                                         module='decoder', bucket_key=bucket_key)
+            return qsym, data_names, label_names
 
         # pylint: disable=not-callable
         default_bucket_key = (self.max_input_length, self.get_max_output_length(self.max_input_length))
@@ -1009,7 +1123,7 @@ class Translator:
                              k=self.beam_size,
                              batch_size=self.batch_size,
                              offset=self.offset,
-                             use_mxnet_topk=True)
+                             use_mxnet_topk=True)  # MXNet implementation is faster on GPUs
 
         self._sort_by_index = SortByIndex()
         self._sort_by_index.initialize(ctx=self.context)
