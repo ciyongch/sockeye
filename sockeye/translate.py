@@ -213,10 +213,27 @@ def translate(output_handler: OutputHandler,
     :param translator: The translator that will be used for each line of input.
     :return: Total time taken.
     """
+    '''
+    import mxnet as mx
+    mx.profiler.set_config(profile_all=True, filename='profile_output.json')
+    '''
     tic = time.time()
+    '''
+    mx.profiler.set_state('run')
+    '''
     trans_outputs = translator.translate(trans_inputs)
     total_time = time.time() - tic
+    '''
+    mx.nd.waitall()
+    mx.profiler.set_state('stop')
+    '''
     batch_time = total_time / len(trans_inputs)
+    encoder_time = inference.g_encoder_sym_time
+    decoder_time = inference.g_decoder_sym_time
+    print ('encoder_sym_time, length={0}, sum={1}'.format(len(encoder_time), sum(encoder_time)))
+    print ('decoder_sym_time, length={0}, sum={1}'.format(len(decoder_time), sum(decoder_time)))
+    #print ('encoder_time: ', encoder_time)
+    #print ('decoder_time: ', decoder_time)
     for trans_input, trans_output in zip(trans_inputs, trans_outputs):
         output_handler.handle(trans_input, trans_output, batch_time)
     return total_time

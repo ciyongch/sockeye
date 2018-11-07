@@ -38,6 +38,98 @@ from .log import is_python34
 logger = logging.getLogger(__name__)
 
 
+g_encoder_sym_time = []
+g_decoder_sym_time = []
+
+class Quantize(object):
+    def __init__(self,
+                 params,
+                 aux_params,
+                 excluded_sym_names=None,
+                 dtype='int8',
+                 logger=logger) -> None:
+        self.params = params
+        self.aux_params = aux_params
+        self.dtype = dtype
+        self.logger = logger
+
+        self.excluded_encoder_sym_names = []
+        self.excluded_decoder_sym_names = []
+        for name in excluded_sym_names:
+            if name.find('encoder') != -1:
+                self.excluded_encoder_sym_names.append(name)
+            else:
+                # logits (FC) is located at decoder
+                self.excluded_decoder_sym_names.append(name)
+
+    def save_symbol(self, fname, sym, logger=None) -> None:
+        if logger is not None:
+            logger.info('Saving symbol into file at %s' % fname)
+        sym.save(fname)
+
+    def save_params(self, fname, params, aux_params, logger=None) -> None:
+        if logger is not None:
+            logger.info('Saving params into file at %s' % fname)
+        save_dict = {('arg:%s' % k): v.as_in_context(cpu()) for k, v in params.items()}
+        save_dict.update({('aux:%s' % k): v.as_in_context(cpu()) for k, v in aux_params.items()})
+        mx.nd.save(fname, save_dict)
+
+    def q_model(self, sym, module='encoder', bucket_key=None):
+        excluded_sym_names = None
+        excluded_syms = []
+
+        sym_file_name = '%s' % (module + '_quantized_')
+
+        timing_list = None
+
+        if module is 'encoder':
+            if self.excluded_encoder_sym_names is None:
+                self.excluded_encoder_sym_name = []
+
+            if not isinstance(self.excluded_encoder_sym_names, list):
+                raise ValueError('excluded_encoder_sym_names must be a list of strings representing'
+                                 ' the names of the symbols that will not be quantized,'
+                                 ' while received type %s' % str(type(self.excluded_encoder_sym_names)))
+            excluded_sym_names = self.excluded_encoder_sym_names
+
+            sym_file_name = '%s_symbol.json' % (sym_file_name + (str(bucket_key) if
+                                                    isinstance(bucket_key, int) else ''))
+            global g_encoder_sym_time
+            timing_list = g_encoder_sym_time
+
+        if module is 'decoder':
+            if self.excluded_decoder_sym_names is None:
+                self.excluded_decoder_sym_name = []
+
+            if not isinstance(self.excluded_decoder_sym_names, list):
+                raise ValueError('excluded_decoder_sym_names must be a list of strings representing'
+                                 ' the names of the symbols that will not be quantized,'
+                                 ' while received type %s' % str(type(self.excluded_decoder_sym_names)))
+            excluded_sym_names = self.excluded_decoder_sym_names
+
+            sym_file_name = '%s_symbol.json' % (sym_file_name + ('-'.join(str(i) for i in bucket_key)
+                                                    if isinstance(bucket_key, tuple) else ''))
+            global g_decoder_sym_time
+            timing_list = g_decoder_sym_time
+        #self.logger.info('Quantizing symbol')
+
+        if self.dtype != 'int8' and self.dtype != 'uint8':
+            raise ValueError('unknown quantized_dtype %s received,'
+                             ' expected `int8` or `uint8`' % self.dtype)
+        start_t = time.time()
+        qsym = mx.contrib.quant._quantize_symbol(sym, excluded_symbols=excluded_sym_names,
+                                                 offline_params=list(self.params.keys()),
+                                                 quantized_dtype=self.dtype)
+        timing_list.append(time.time() - start_t)
+
+        #self.save_symbol(sym_file_name, qsym, self.logger)
+        return qsym
+
+    def q_params(self, qsym, params):
+        self.logger.info('Quantizing params')
+        return mx.contrib.quant._quantize_params(qsym, params)
+
+
 class InferenceModel(model.SockeyeModel):
     """
     InferenceModel is a SockeyeModel that supports three operations used for inference/decoding:
@@ -95,6 +187,12 @@ class InferenceModel(model.SockeyeModel):
         self.output_layer_w = None  # type: Optional[mx.nd.NDArray]
         self.output_layer_b = None  # type: Optional[mx.nd.NDArray]
 
+        self.quantize = None
+        self.encoder_quantize_symbols = {}
+        self.decoder_quantize_symbols = {}
+        self.encoder_calib_collectors = {}
+        self.decoder_calib_collectors = {}
+
     @property
     def num_source_factors(self) -> int:
         """
@@ -128,6 +226,22 @@ class InferenceModel(model.SockeyeModel):
                                   "maximum output length depends on the input length and the source/target length "
                                   "ratio observed during training." % (self.max_supported_seq_len_target,
                                                                        decoder_max_len))
+        self.load_params_from_file(self.params_fname)
+        excluded_sym_names = ["encoder_birnn_forward_l0_t0_h2h",
+                              "encoder_birnn_reverse_l0_t0_h2h",
+                              "encoder_rnn_l0_t0_h2h",
+                              "encoder_rnn_l1_t0_h2h",
+                              "encoder_rnn_l2_t0_h2h",
+                              "encoder_rnn_l3_t0_h2h",
+                              "encoder_rnn_l4_t0_h2h",
+                              "encoder_rnn_l5_t0_h2h",
+                              "encoder_rnn_l6_t0_h2h",
+                              "logits",
+                              ]
+        self.quantize = Quantize(self.params, self.aux_params,
+                                 excluded_sym_names=excluded_sym_names,
+                                 dtype='int8',
+                                 logger=logger)
 
         self.encoder_module, self.encoder_default_bucket_key = self._get_encoder_module()
         self.decoder_module, self.decoder_default_bucket_key = self._get_decoder_module()
@@ -137,7 +251,7 @@ class InferenceModel(model.SockeyeModel):
         self.encoder_module.bind(data_shapes=max_encoder_data_shapes, for_training=False, grad_req="null")
         self.decoder_module.bind(data_shapes=max_decoder_data_shapes, for_training=False, grad_req="null")
 
-        self.load_params_from_file(self.params_fname)
+        #self.load_params_from_file(self.params_fname)
         self.encoder_module.init_params(arg_params=self.params, aux_params=self.aux_params, allow_missing=False)
         self.decoder_module.init_params(arg_params=self.params, aux_params=self.aux_params, allow_missing=False)
 
@@ -305,6 +419,26 @@ class InferenceModel(model.SockeyeModel):
         self.encoder_module.forward(data_batch=batch, is_train=False)
         decoder_states = self.encoder_module.get_outputs()
 
+        #### calib begin
+        encoder_name = 'encoder_{0}'.format(source_max_length)
+        fp32_sym = self.encoder_module.symbol()
+        mod = self.encoder_module._curr_module
+
+        #calib_layer = lambda name: name.endswith('t0_i2h_output') #TODO debug only
+        calib_layer = None
+
+        if encoder_name not in self.encoder_quantize_symbols:
+            qsym = self.quantize.q_model(sym=fp32_sym, module='encoder', bucket_key=source_max_length)
+            collector = mx.contrib.quant._LayerOutputMinMaxCollector(calib_layer, logger=logger)
+
+            self.encoder_quantize_symbols[encoder_name] = qsym
+            self.encoder_calib_collectors[encoder_name] = collector
+
+        # collect min/max for all the outputs
+        mx.contrib.quant._collect_layer_statistics(mod, batch,
+            self.encoder_calib_collectors[encoder_name], logger=logger)
+        #### calib end
+
         # replicate encoder/init module results beam size times
         decoder_states = [mx.nd.repeat(s, repeats=self.beam_size, axis=0) for s in decoder_states]
         return ModelState(decoder_states)
@@ -325,6 +459,24 @@ class InferenceModel(model.SockeyeModel):
             provide_data=self._get_decoder_data_shapes(bucket_key))
         self.decoder_module.forward(data_batch=batch, is_train=False)
         out, attention_probs, *model_state.states = self.decoder_module.get_outputs()
+
+        #### calib begin
+        decoder_name = 'decoder_{0}_{1}'.format(bucket_key[0], bucket_key[1])
+        fp32_sym = self.decoder_module.symbol()
+        mod = self.decoder_module._curr_module
+
+        if decoder_name not in self.decoder_quantize_symbols:
+            qsym = self.quantize.q_model(sym=fp32_sym, module='decoder', bucket_key=bucket_key)
+            collector = mx.contrib.quant._LayerOutputMinMaxCollector(None, logger=logger)
+
+            self.decoder_quantize_symbols[decoder_name] = qsym
+            self.decoder_calib_collectors[decoder_name] = collector
+
+        # collect min/max for all the outputs
+        mx.contrib.quant._collect_layer_statistics(mod, batch,
+            self.decoder_calib_collectors[decoder_name], logger=logger)
+        #### calib end
+
         return out, attention_probs, model_state
 
     @property
@@ -1250,6 +1402,42 @@ class Translator:
                 translation = self._concat_translations(translations_to_concat)
 
             results.append(self._make_result(trans_input, translation))
+
+        ## calib_qsym #FIXME
+        logger.info('save calibrate sym and min/max for encoder...')
+        qsyms = self.models[0].encoder_quantize_symbols
+        collectors = self.models[0].encoder_calib_collectors
+        min_len = 1e9
+        for k, v in qsyms.items():
+            th_dict = collectors[k].min_max_dict
+            cqsym = mx.contrib.quant._calibrate_quantized_sym(v, th_dict)
+            cqsym.save('calib/%s.json' % k)
+
+            if len(th_dict) < min_len:
+                min_len = len(th_dict)
+                min_encoder_symbol = v
+
+        logger.info('save calibrate sym and min/max for decoder...')
+        qsyms = self.models[0].decoder_quantize_symbols
+        collectors = self.models[0].decoder_calib_collectors
+        min_len = 1e9
+        for k, v in qsyms.items():
+            th_dict = collectors[k].min_max_dict
+            cqsym = mx.contrib.quant._calibrate_quantized_sym(v, th_dict)
+            cqsym.save('calib/%s.json' % k)
+
+            if len(th_dict) < min_len:
+                min_len = len(th_dict)
+                min_decoder_symbol = v
+
+        logger.info('save quantize params...')
+        q_encoder_params = mx.contrib.quant._quantize_params(min_encoder_symbol, self.models[0].params)
+        q_decoder_params = mx.contrib.quant._quantize_params(min_decoder_symbol, self.models[0].params)
+        qarg_params = {}
+        qarg_params.update(q_encoder_params)
+        qarg_params.update(q_decoder_params)
+        save_dict = {('arg:%s' % k): v.as_in_context(mx.cpu()) for k, v in qarg_params.items()}
+        mx.nd.save('calib/params.quantized', save_dict)
 
         return results
 
