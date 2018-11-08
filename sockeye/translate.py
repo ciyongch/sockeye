@@ -29,6 +29,7 @@ from . import arguments
 from . import constants as C
 from . import data_io
 from . import inference
+from . import quantize
 
 logger = setup_main_logger(__name__, file_logging=False)
 
@@ -87,7 +88,9 @@ def run_translate(args: argparse.Namespace):
             max_output_length_num_stds=args.max_output_length_num_stds,
             decoder_return_logit_inputs=args.restrict_lexicon is not None,
             cache_output_layer_w_b=args.restrict_lexicon is not None,
-            override_dtype=args.override_dtype)
+            override_dtype=args.override_dtype,
+            run_quantize=args.run_quantize,
+            run_offline_calib=args.run_offline_calib)
         restrict_lexicon = None  # type: Optional[TopKLexicon]
         if args.restrict_lexicon:
             restrict_lexicon = TopKLexicon(source_vocabs[0], target_vocab)
@@ -228,8 +231,8 @@ def translate(output_handler: OutputHandler,
     mx.profiler.set_state('stop')
     '''
     batch_time = total_time / len(trans_inputs)
-    encoder_time = inference.g_encoder_sym_time
-    decoder_time = inference.g_decoder_sym_time
+    encoder_time = quantize.g_encoder_sym_time
+    decoder_time = quantize.g_decoder_sym_time
     print ('encoder_sym_time, length={0}, sum={1}'.format(len(encoder_time), sum(encoder_time)))
     print ('decoder_sym_time, length={0}, sum={1}'.format(len(decoder_time), sum(decoder_time)))
     #print ('encoder_time: ', encoder_time)

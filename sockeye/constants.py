@@ -201,6 +201,7 @@ JSON_ENCODING = "utf-8"
 # Lexical constraints
 BANK_ADJUSTMENT = 'even'
 
+CALIB_PATH = 'calib'
 VERSION_NAME = "version"
 CONFIG_NAME = "config"
 LOG_NAME = "log"
@@ -213,6 +214,7 @@ VOCAB_ENCODING = "utf-8"
 PARAMS_PREFIX = "params."
 PARAMS_NAME = PARAMS_PREFIX + "%05d"
 PARAMS_BEST_NAME = "params.best"
+PARAMS_QUANT_NAME = "params.quantized"
 DECODE_OUT_NAME = "decode.output.%05d"
 DECODE_IN_NAME = "decode.source.%d"
 DECODE_REF_NAME = "decode.target"

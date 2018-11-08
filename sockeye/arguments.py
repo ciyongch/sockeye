@@ -1227,6 +1227,18 @@ def add_inference_args(params):
                                type=str,
                                help='EXPERIMENTAL: may be changed or removed in future. Overrides training dtype of '
                                     'encoders and decoders during inference. Default: %(default)s')
+    decode_params.add_argument('--calibration',
+                               default='./calib',
+                               nargs='?',
+                               help='Calibration folder(s). Calibrated symbols and params are store in this folder')
+    decode_params.add_argument('--run-quantize',
+                               default=False,
+                               action='store_true',
+                               help='run the quantize flow either from calibrated symobls or online.')
+    decode_params.add_argument('--run-offline-calib',
+                               default=False,
+                               action='store_true',
+                               help='do the offline calibration and save calib symbols and params.')
 
 
 def add_evaluate_args(params):
