@@ -21,7 +21,7 @@ import os
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
-from typing import Callable, Dict, Generator, List, NamedTuple, Optional, Tuple, Union, Set
+from typing import Callable, Dict, Generator, List, NamedTuple, Optional, Tuple, Union, Set, Any
 
 import mxnet as mx
 import numpy as np
@@ -67,14 +67,13 @@ class InferenceModel(model.SockeyeModel):
                  context: mx.context.Context,
                  beam_size: int,
                  batch_size: int,
+                 calib_params: Dict[str, Any],
                  softmax_temperature: Optional[float] = None,
                  max_output_length_num_stds: int = C.DEFAULT_NUM_STD_MAX_OUTPUT_LENGTH,
                  decoder_return_logit_inputs: bool = False,
                  cache_output_layer_w_b: bool = False,
                  forced_max_output_len: Optional[int] = None,
-                 skip_softmax: bool = False,
-                 run_quantize: bool = False,
-                 run_offline_calib: bool = False) -> None:
+                 skip_softmax: bool = False) -> None:
         super().__init__(config)
         self.params_fname = params_fname
         self.context = context
@@ -100,12 +99,10 @@ class InferenceModel(model.SockeyeModel):
         self.output_layer_w = None  # type: Optional[mx.nd.NDArray]
         self.output_layer_b = None  # type: Optional[mx.nd.NDArray]
 
-        self.run_quantize = run_quantize
-        self.run_offline_calib = run_offline_calib
-        if run_quantize or run_offline_calib:
-            assert (run_quantize is True and run_offline_calib is True, 'Please specify either'
-                    '"run_quantize" or "run_offline_calib", but not both')
-
+        self.calib_path = calib_params['calib_path']
+        self.run_quantize = calib_params['run_quantize']
+        self.run_offline_calib = calib_params['run_offline_calib']
+        if self.run_quantize or self.run_offline_calib:
             self.quant = None
             self.quantized_encoder_symbols = {}
             self.quantized_decoder_symbols = {}
@@ -152,13 +149,15 @@ class InferenceModel(model.SockeyeModel):
             self.quant = quantize.initialize_quantizer(self.params, self.aux_params, dtype='int8', logger=logger)
 
         if self.run_quantize:
-            calib_path = C.CALIB_PATH
+            calib_path = self.calib_path
             self.params_fname = os.path.join(calib_path, C.PARAMS_QUANT_NAME)
             self.quantized_encoder_symbols, self.quantized_decoder_symbols = quantize.load_quantized_symbols(calib_path)
+            assert (isinstance(self.quantized_encoder_symbols, dict) and
+                    isinstance(self.quantized_decoder_symbols, dict))
             if len(self.quantized_encoder_symbols) == 0:
-                logger.warning("No quantized encoder symbols to use...")
+                logger.info("No quantized encoder symbols to use...")
             if len(self.quantized_decoder_symbols) == 0:
-                logger.warning("No quantized decoder symbols to use...")
+                logger.info("No quantized decoder symbols to use...")
 
         self.encoder_module, self.encoder_default_bucket_key = self._get_encoder_module()
         self.decoder_module, self.decoder_default_bucket_key = self._get_decoder_module()
@@ -202,6 +201,7 @@ class InferenceModel(model.SockeyeModel):
                 if sym_name in self.quantized_encoder_symbols:
                     return self.quantized_encoder_symbols[sym_name], data_names, label_names
                 else:
+                    logger.info('running online calibration for %s', sym_name)
                     online_quantize = True
 
             source = mx.sym.Variable(C.SOURCE_NAME)
@@ -271,6 +271,7 @@ class InferenceModel(model.SockeyeModel):
                 if sym_name in self.quantized_decoder_symbols:
                     return self.quantized_decoder_symbols[sym_name], data_names, label_names
                 else:
+                    logger.info('running online calibration for %s', sym_name)
                     online_quantize = True
 
             # embedding for previous word
@@ -360,25 +361,17 @@ class InferenceModel(model.SockeyeModel):
         decoder_states = self.encoder_module.get_outputs()
 
         if self.run_offline_calib:
-            #### calib begin
-            encoder_name = 'encoder_{0}'.format(source_max_length)
-            fp32_sym = self.encoder_module.symbol()
-            mod = self.encoder_module._curr_module
-
             #calib_layer = lambda name: name.endswith('t0_i2h_output') #TODO debug only
             calib_layer = None
-
-            if encoder_name not in self.quantized_encoder_symbols:
-                qsym = self.quant.quantize_symbol(sym=fp32_sym, module='encoder', bucket_key=source_max_length)
-                collector = mx.contrib.quant._LayerOutputMinMaxCollector(calib_layer, logger=logger)
-
-                self.quantized_encoder_symbols[encoder_name] = qsym
-                self.encoder_calib_collectors[encoder_name] = collector
-
-            # collect min/max for all the outputs
-            mx.contrib.quant._collect_layer_statistics(mod, batch,
-                self.encoder_calib_collectors[encoder_name], logger=logger)
-            #### calib end
+            quantize.update_qsymbols_and_collectors(name='encoder',
+                                                    bucket_key=source_max_length,
+                                                    module=self.encoder_module,
+                                                    quant=self.quant,
+                                                    quantized_symbols=self.quantized_encoder_symbols,
+                                                    calib_collectors=self.encoder_calib_collectors,
+                                                    calib_layer=calib_layer,
+                                                    batch=batch,
+                                                    logger=logger)
 
         # replicate encoder/init module results beam size times
         decoder_states = [mx.nd.repeat(s, repeats=self.beam_size, axis=0) for s in decoder_states]
@@ -402,22 +395,16 @@ class InferenceModel(model.SockeyeModel):
         out, attention_probs, *model_state.states = self.decoder_module.get_outputs()
 
         if self.run_offline_calib:
-            #### calib begin
-            decoder_name = 'decoder_{0}_{1}'.format(bucket_key[0], bucket_key[1])
-            fp32_sym = self.decoder_module.symbol()
-            mod = self.decoder_module._curr_module
-
-            if decoder_name not in self.quantized_decoder_symbols:
-                qsym = self.quant.quantize_symbol(sym=fp32_sym, module='decoder', bucket_key=bucket_key)
-                collector = mx.contrib.quant._LayerOutputMinMaxCollector(None, logger=logger)
-
-                self.quantized_decoder_symbols[decoder_name] = qsym
-                self.decoder_calib_collectors[decoder_name] = collector
-
-            # collect min/max for all the outputs
-            mx.contrib.quant._collect_layer_statistics(mod, batch,
-                self.decoder_calib_collectors[decoder_name], logger=logger)
-            #### calib end
+            calib_layer = None
+            quantize.update_qsymbols_and_collectors(name='decoder',
+                                                    bucket_key=bucket_key,
+                                                    module=self.decoder_module,
+                                                    quant=self.quant,
+                                                    quantized_symbols=self.quantized_decoder_symbols,
+                                                    calib_collectors=self.decoder_calib_collectors,
+                                                    calib_layer=calib_layer,
+                                                    batch=batch,
+                                                    logger=logger)
 
         return out, attention_probs, model_state
 
@@ -458,6 +445,7 @@ def load_models(context: mx.context.Context,
                 max_input_len: Optional[int],
                 beam_size: int,
                 batch_size: int,
+                calib_params: Dict[str, Any],
                 model_folders: List[str],
                 checkpoints: Optional[List[int]] = None,
                 softmax_temperature: Optional[float] = None,
@@ -465,11 +453,9 @@ def load_models(context: mx.context.Context,
                 decoder_return_logit_inputs: bool = False,
                 cache_output_layer_w_b: bool = False,
                 forced_max_output_len: Optional[int] = None,
-                override_dtype: Optional[str] = None,
-                run_quantize: bool = False,
-                run_offline_calib: bool = False) -> Tuple[List[InferenceModel],
-                                                           List[vocab.Vocab],
-                                                           vocab.Vocab]:
+                override_dtype: Optional[str] = None) -> Tuple[List[InferenceModel],
+                                                               List[vocab.Vocab],
+                                                               vocab.Vocab]:
     """
     Loads a list of models for inference.
 
@@ -531,12 +517,11 @@ def load_models(context: mx.context.Context,
                                          context=context,
                                          beam_size=beam_size,
                                          batch_size=batch_size,
+                                         calib_params=calib_params,
                                          softmax_temperature=softmax_temperature,
                                          decoder_return_logit_inputs=decoder_return_logit_inputs,
                                          cache_output_layer_w_b=cache_output_layer_w_b,
-                                         skip_softmax=skip_softmax,
-                                         run_quantize=run_quantize,
-                                         run_offline_calib=run_offline_calib)
+                                         skip_softmax=skip_softmax)
         utils.check_condition(inference_model.num_source_factors == len(model_source_vocabs),
                               "Number of loaded source vocabularies (%d) does not match "
                               "number of source factors for model '%s' (%d)" % (len(model_source_vocabs), model_folder,
@@ -1350,46 +1335,14 @@ class Translator:
             results.append(self._make_result(trans_input, translation))
 
         if self.models[0].run_offline_calib:
-            ## calib_qsym #FIXME
-            calib_path = C.CALIB_PATH
-            logger.info('save calibrate sym and min/max for encoder into %s...', calib_path)
-            if not os.path.isdir(calib_path):
-                os.mkdir(calib_path)
-
-            qsyms = self.models[0].quantized_encoder_symbols
-            collectors = self.models[0].encoder_calib_collectors
-            min_len = 1e9
-            for k, v in qsyms.items():
-                th_dict = collectors[k].min_max_dict
-                cqsym = mx.contrib.quant._calibrate_quantized_sym(v, th_dict)
-                cqsym.save('calib/%s.json' % k)
-
-                if len(th_dict) < min_len:
-                    min_len = len(th_dict)
-                    min_encoder_symbol = v
-
-            logger.info('save calibrate sym and min/max for decoder into %s...', calib_path)
-            qsyms = self.models[0].quantized_decoder_symbols
-            collectors = self.models[0].decoder_calib_collectors
-            min_len = 1e9
-            for k, v in qsyms.items():
-                th_dict = collectors[k].min_max_dict
-                cqsym = mx.contrib.quant._calibrate_quantized_sym(v, th_dict)
-                cqsym.save('calib/%s.json' % k)
-
-                if len(th_dict) < min_len:
-                    min_len = len(th_dict)
-                    min_decoder_symbol = v
-
-            logger.info('save quantize params into %s...', calib_path)
-            q_encoder_params = mx.contrib.quant._quantize_params(min_encoder_symbol, self.models[0].params)
-            q_decoder_params = mx.contrib.quant._quantize_params(min_decoder_symbol, self.models[0].params)
-            qarg_params = {}
-            qarg_params.update(q_encoder_params)
-            qarg_params.update(q_decoder_params)
-            save_dict = {('arg:%s' % k): v.as_in_context(mx.cpu()) for k, v in qarg_params.items()}
-            qparams_fname = os.path.join(calib_path, C.PARAMS_QUANT_NAME)
-            mx.nd.save(qparams_fname, save_dict)
+            quantize.save_calib_symbols_and_params(
+                calib_path=self.models[0].calib_path,
+                params=self.models[0].params,
+                encoder_symbols=self.models[0].quantized_encoder_symbols,
+                encoder_collectors=self.models[0].encoder_calib_collectors,
+                decoder_symbols=self.models[0].quantized_decoder_symbols,
+                decoder_collectors=self.models[0].decoder_calib_collectors,
+                logger=logger)
 
         return results
 

@@ -63,6 +63,14 @@ def run_translate(args: argparse.Namespace):
                                         args.output,
                                         args.sure_align_threshold)
 
+    check_condition(not (args.run_quantize is True and args.run_offline_calib is True),
+        'Please specify either "run_quantize" or "run_offline_calib", but not both')
+
+    calib_params = {}
+    calib_params['calib_path'] = args.calib_path
+    calib_params['run_quantize'] = args.run_quantize
+    calib_params['run_offline_calib'] = args.run_offline_calib
+
     with ExitStack() as exit_stack:
         check_condition(len(args.device_ids) == 1, "translate only supports single device for now")
         context = determine_context(device_ids=args.device_ids,
@@ -82,15 +90,14 @@ def run_translate(args: argparse.Namespace):
             max_input_len=args.max_input_len,
             beam_size=args.beam_size,
             batch_size=args.batch_size,
+            calib_params=calib_params,
             model_folders=args.models,
             checkpoints=args.checkpoints,
             softmax_temperature=args.softmax_temperature,
             max_output_length_num_stds=args.max_output_length_num_stds,
             decoder_return_logit_inputs=args.restrict_lexicon is not None,
             cache_output_layer_w_b=args.restrict_lexicon is not None,
-            override_dtype=args.override_dtype,
-            run_quantize=args.run_quantize,
-            run_offline_calib=args.run_offline_calib)
+            override_dtype=args.override_dtype)
         restrict_lexicon = None  # type: Optional[TopKLexicon]
         if args.restrict_lexicon:
             restrict_lexicon = TopKLexicon(source_vocabs[0], target_vocab)
@@ -216,27 +223,32 @@ def translate(output_handler: OutputHandler,
     :param translator: The translator that will be used for each line of input.
     :return: Total time taken.
     """
-    '''
-    import mxnet as mx
-    mx.profiler.set_config(profile_all=True, filename='profile_output.json')
-    '''
+    import os
+    is_profiler_on = os.getenv('SOCKEYE_PROFILE', False)
+    profile_file = os.getenv('SOCKEYE_PROF_FILE', 'profile_output.json')
+    if is_profiler_on:
+        import mxnet as mx
+        mx.profiler.set_config(profile_all=True, filename=profile_file)
+        logger.info('Save profiling results to %s, this make take a while to finish...', profile_file)
+
     tic = time.time()
-    '''
-    mx.profiler.set_state('run')
-    '''
+
+    if is_profiler_on:
+        mx.profiler.set_state('run')
+
     trans_outputs = translator.translate(trans_inputs)
     total_time = time.time() - tic
-    '''
-    mx.nd.waitall()
-    mx.profiler.set_state('stop')
-    '''
+
+    if is_profiler_on:
+        mx.nd.waitall()
+        mx.profiler.set_state('stop')
+
     batch_time = total_time / len(trans_inputs)
+
     encoder_time = quantize.g_encoder_sym_time
     decoder_time = quantize.g_decoder_sym_time
     print ('encoder_sym_time, length={0}, sum={1}'.format(len(encoder_time), sum(encoder_time)))
     print ('decoder_sym_time, length={0}, sum={1}'.format(len(decoder_time), sum(decoder_time)))
-    #print ('encoder_time: ', encoder_time)
-    #print ('decoder_time: ', decoder_time)
     for trans_input, trans_output in zip(trans_inputs, trans_outputs):
         output_handler.handle(trans_input, trans_output, batch_time)
     return total_time

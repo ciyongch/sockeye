@@ -20,6 +20,7 @@ import os
 import time
 from typing import Optional
 from . import utils
+from . import constants as C
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +54,13 @@ class Quantize(object):
         save_dict.update({('aux:%s' % k): v.as_in_context(mx.cpu()) for k, v in aux_params.items()})
         mx.nd.save(fname, save_dict)
 
-    def quantize_symbol(self, sym, module='encoder', bucket_key=None):
+    def quantize_symbol(self, sym, name='encoder', bucket_key=None):
         excluded_sym_names = None
-        sym_file_name = '%s' % (module + '_quantized')
+        sym_file_name = '%s' % (name + '_quantized')
 
         timing_list = None
 
-        if module is 'encoder':
+        if name is 'encoder':
             if self.excluded_encoder_sym_names is None:
                 self.excluded_encoder_sym_name = []
 
@@ -74,7 +75,7 @@ class Quantize(object):
             global g_encoder_sym_time
             timing_list = g_encoder_sym_time
 
-        if module is 'decoder':
+        if name is 'decoder':
             if self.excluded_decoder_sym_names is None:
                 self.excluded_decoder_sym_name = []
 
@@ -133,20 +134,103 @@ def load_quantized_symbols(path):
     files = os.listdir(path)
     encoder_syms = {}
     decoder_syms = {}
-    encoder_sym_count = 0
-    decoder_sym_count = 0
     for f in files:
         f = os.path.join(path, f)
         if not os.path.isdir(f):
-            sym_name, _ = os.path.splitext(f)
+            sym_name = os.path.basename(f)
+            sym_name = os.path.splitext(sym_name)[0]
             if sym_name.find('encoder') != -1:
                 encoder_syms[sym_name] = mx.symbol.load(f)
-                encoder_sym_count += 1
             if sym_name.find('decoder') != -1:
                 decoder_syms[sym_name] = mx.symbol.load(f)
-                decoder_sym_count += 1
 
     load_time = time.time() - tic
     logger.info('Success to load %d calib_encoder_syms and %d calib_decoder syms in %.4fs',
-                encoder_sym_count, decoder_sym_count, load_time)
+                len(encoder_syms), len(decoder_syms), load_time)
     return encoder_syms, decoder_syms
+
+
+def update_qsymbols_and_collectors(name,
+                                  bucket_key=None,
+                                  module=None,
+                                  quant=None,
+                                  quantized_symbols=None,
+                                  calib_collectors=None,
+                                  calib_layer=None,
+                                  batch=None,
+                                  logger=None):
+
+    assert name in ['encoder', 'decoder']
+
+    fp32_sym = module.symbol()
+    mod = module._curr_module
+
+    if name not in quantized_symbols:
+        qsym = quant.quantize_symbol(sym=fp32_sym, name=name, bucket_key=bucket_key)
+        collector = mx.contrib.quant._LayerOutputMinMaxCollector(calib_layer, logger=logger)
+
+        if name == 'encoder':
+            assert isinstance(bucket_key, int)
+            name += '_%d' % bucket_key
+        else:
+            assert isinstance(bucket_key, tuple)
+            name += '_%d_%d' % (bucket_key[0], bucket_key[1])
+        quantized_symbols[name] = qsym
+        calib_collectors[name] = collector
+
+    mx.contrib.quant._collect_layer_statistics(mod, batch,
+        calib_collectors[name], logger=logger)
+
+
+def save_calib_symbols_and_params(calib_path,
+                                  params,
+                                  encoder_symbols,
+                                  encoder_collectors,
+                                  decoder_symbols,
+                                  decoder_collectors,
+                                  logger=None):
+    assert isinstance(encoder_symbols, dict)
+    assert isinstance(encoder_collectors, dict)
+    assert isinstance(decoder_symbols, dict)
+    assert isinstance(decoder_collectors, dict)
+    logger.info('save calibrate sym and min/max for encoder into %s...', calib_path)
+    if not os.path.isdir(calib_path):
+        os.mkdir(calib_path)
+
+    min_encoder_symbol = None
+    min_decoder_symbol = None
+
+    min_len = 1e9
+    for k, v in encoder_symbols.items():
+        th_dict = encoder_collectors[k].min_max_dict
+        cqsym = mx.contrib.quant._calibrate_quantized_sym(v, th_dict)
+        cqsym.save(os.path.join(calib_path, '%s.json' % k))
+
+        if len(th_dict) < min_len:
+            min_len = len(th_dict)
+            min_encoder_symbol = v
+
+    logger.info('save calibrate sym and min/max for decoder into %s...', calib_path)
+    min_len = 1e9
+    for k, v in decoder_symbols.items():
+        th_dict = decoder_collectors[k].min_max_dict
+        cqsym = mx.contrib.quant._calibrate_quantized_sym(v, th_dict)
+        cqsym.save(os.path.join(calib_path, '%s.json' % k))
+
+        if len(th_dict) < min_len:
+            min_len = len(th_dict)
+            min_decoder_symbol = v
+
+    logger.info('save quantize params into %s...', calib_path)
+    qarg_params = {}
+    if min_encoder_symbol is not None:
+        q_encoder_params = mx.contrib.quant._quantize_params(min_encoder_symbol, params)
+        qarg_params.update(q_encoder_params)
+
+    if min_decoder_symbol is not None:
+        q_decoder_params = mx.contrib.quant._quantize_params(min_decoder_symbol, params)
+        qarg_params.update(q_decoder_params)
+
+    save_dict = {('arg:%s' % k): v.as_in_context(mx.cpu()) for k, v in qarg_params.items()}
+    qparams_fname = os.path.join(calib_path, C.PARAMS_QUANT_NAME)
+    mx.nd.save(qparams_fname, save_dict)

@@ -1227,7 +1227,7 @@ def add_inference_args(params):
                                type=str,
                                help='EXPERIMENTAL: may be changed or removed in future. Overrides training dtype of '
                                     'encoders and decoders during inference. Default: %(default)s')
-    decode_params.add_argument('--calibration',
+    decode_params.add_argument('--calib-path',
                                default='./calib',
                                nargs='?',
                                help='Calibration folder(s). Calibrated symbols and params are store in this folder')
