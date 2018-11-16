@@ -38,6 +38,7 @@ class RNNConfig(Config):
     :param forget_bias: Initial value of forget biases.
     :param lhuc: Apply LHUC (Vilar 2018) to the hidden units of the RNN.
     :param dtype: Data type.
+    :param fused: call MXNet fused RNN API
     """
 
     def __init__(self,
@@ -51,7 +52,8 @@ class RNNConfig(Config):
                  first_residual_layer: int = 2,
                  forget_bias: float = 0.0,
                  lhuc: bool = False,
-                 dtype: str = C.DTYPE_FP32) -> None:
+                 dtype: str = C.DTYPE_FP32,
+                 fused: bool = False) -> None:
         super().__init__()
         self.cell_type = cell_type
         self.num_hidden = num_hidden
@@ -64,6 +66,7 @@ class RNNConfig(Config):
         self.forget_bias = forget_bias
         self.lhuc = lhuc
         self.dtype = dtype
+        self.fused = fused
 
 
 class SequentialRNNCellParallelInput(mx.rnn.SequentialRNNCell):
@@ -112,6 +115,31 @@ class ResidualCellParallelInput(mx.rnn.ResidualCell):
         output, states = self.base_cell(concat_inputs, states)
         output = mx.symbol.elemwise_add(output, inputs, name="%s_plus_residual" % output.name)
         return output, states
+
+
+def get_fused_rnn(config: RNNConfig, prefix: str,
+                  parallel_inputs: bool = False,
+                  layers: Optional[Iterable[int]] = None) -> mx.rnn.FusedRNNCell:
+    if config.cell_type not in [C.LSTM_TYPE, C.GRU_TYPE]:
+        raise NotImplementedError("%s is not support" % config.cell_type)
+
+    if config.residual:
+        raise NotImplementedError("Residaul connection is not supported")
+
+    if config.lhuc:
+        raise NotImplementedError("LHUC is not supported")
+
+    if config.dropout_states > 0.0 or config.dropout_recurrent > 0.0:
+        raise NotImplementedError("dropout for states and cells is not supported")
+
+    rnn = mx.rnn.FusedRNNCell(config.num_hidden,
+                              num_layers=config.num_layers,
+                              prefix=prefix,
+                              mode=config.cell_type,
+                              get_next_state=True,
+                              dropout=config.dropout_inputs,
+                              forget_bias=config.forget_bias)
+    return rnn
 
 
 def get_stacked_rnn(config: RNNConfig, prefix: str,

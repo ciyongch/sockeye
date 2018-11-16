@@ -829,7 +829,10 @@ class RecurrentEncoder(Encoder):
         super().__init__(rnn_config.dtype)
         self.rnn_config = rnn_config
         self.layout = layout
-        self.rnn = rnn.get_stacked_rnn(rnn_config, prefix)
+        if self.rnn_config.fused:
+            self.rnn = rnn.get_fused_rnn(rnn_config, prefix)
+        else:
+            self.rnn = rnn.get_stacked_rnn(rnn_config, prefix)
 
     def encode(self,
                data: mx.sym.Symbol,
