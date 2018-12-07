@@ -119,7 +119,8 @@ class ResidualCellParallelInput(mx.rnn.ResidualCell):
 
 def get_fused_rnn(config: RNNConfig, prefix: str,
                   parallel_inputs: bool = False,
-                  layers: Optional[Iterable[int]] = None) -> mx.rnn.FusedRNNCell:
+                  layers: Optional[Iterable[int]] = None,
+                  bidirectional: Optional[bool] = False) -> mx.rnn.FusedRNNCell:
     if config.cell_type not in [C.LSTM_TYPE, C.GRU_TYPE]:
         raise NotImplementedError("%s is not support" % config.cell_type)
 
@@ -136,6 +137,7 @@ def get_fused_rnn(config: RNNConfig, prefix: str,
                               num_layers=config.num_layers,
                               prefix=prefix,
                               mode=config.cell_type,
+                              bidirectional=bidirectional,
                               get_next_state=True,
                               dropout=config.dropout_inputs,
                               forget_bias=config.forget_bias)

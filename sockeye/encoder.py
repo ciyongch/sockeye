@@ -154,7 +154,8 @@ def get_recurrent_encoder(config: RecurrentEncoderConfig, prefix: str) -> 'Encod
                               "Residual connections on the first encoder layer are not supported")
 
     # One layer bi-directional RNN:
-    encoder_seq.append(BiDirectionalRNNEncoder,
+    bidirectional_class = BiDirectionalFusedRNNEncoder if config.rnn_config.fused else BiDirectionalRNNEncoder
+    encoder_seq.append(bidirectional_class,
                        rnn_config=config.rnn_config.copy(num_layers=1),
                        prefix=prefix + C.BIDIRECTIONALRNN_PREFIX,
                        layout=C.TIME_MAJOR)
@@ -861,6 +862,30 @@ class RecurrentEncoder(Encoder):
         Return the representation size of this encoder.
         """
         return self.rnn_config.num_hidden
+
+
+class BiDirectionalFusedRNNEncoder(RecurrentEncoder):
+    """
+    An encoder that runs a bidirectional Fused RNN over input data.
+
+    :param rnn_config: RNN configuration.
+    :param prefix: Prefix for variable names.
+    :param layout: Data layout.
+    """
+
+    def __init__(self,
+                 rnn_config: rnn.RNNConfig,
+                 prefix: str = C.STACKEDRNN_PREFIX,
+                 layout: str = C.TIME_MAJOR) -> None:
+        utils.check_condition(rnn_config.fused,  "BiDirectionalFusedRNNEncoder is only valid "
+                              "when rnn_config.fused is set to True.")
+        utils.check_condition(rnn_config.num_hidden % 2 == 0,
+                              "num_hidden must be a multiple of 2 for BiDirectionalRNNEncoders.")
+        super().__init__(rnn_config=rnn_config,
+                         prefix=prefix,
+                         layout=layout)
+        self.rnn_config = rnn_config.copy(num_hidden=rnn_config.num_hidden // 2)
+        self.rnn = rnn.get_fused_rnn(rnn_config, prefix, bidirectional=True)
 
 
 class BiDirectionalRNNEncoder(Encoder):
