@@ -103,6 +103,21 @@ class ParallelInputCell(mx.rnn.ModifierCell):
         return output, states
 
 
+class ParallelInputFusedRNN(mx.rnn.ModifierCell):
+    """
+    A modifier cell that accepts two input vectors and concatenates them before
+    calling the Fused RNN. Typically it is used for concatenating the
+    normal and the parallel input in a fused rnn.
+    """
+
+    def __call__(self, inputs, parallel_inputs, states):
+        # inputs/parallel_inputs shape: (1, batch_size, num_hidden)
+        concat_inputs = mx.sym.concat(inputs, parallel_inputs, dim=2)
+        # Fused rnn only supports unroll but not step mode
+        output, states = self.base_cell.unroll(1, concat_inputs, states, layout='TNC')
+        return output, states
+
+
 class ResidualCellParallelInput(mx.rnn.ResidualCell):
     """
     A ResidualCell, where an additional "parallel" input can be given at call
@@ -133,14 +148,32 @@ def get_fused_rnn(config: RNNConfig, prefix: str,
     if config.dropout_states > 0.0 or config.dropout_recurrent > 0.0:
         raise NotImplementedError("dropout for states and cells is not supported")
 
-    rnn = mx.rnn.FusedRNNCell(config.num_hidden,
-                              num_layers=config.num_layers,
-                              prefix=prefix,
-                              mode=config.cell_type,
-                              bidirectional=bidirectional,
-                              get_next_state=True,
-                              dropout=config.dropout_inputs,
-                              forget_bias=config.forget_bias)
+    if parallel_inputs:
+        rnn = SequentialRNNCellParallelInput()
+        if not layers:
+            layers = range(config.num_layers)
+        for layer_idx in layers:
+            cell_prefix = "%sl%d_" % (prefix, layer_idx)
+            cell = mx.rnn.FusedRNNCell(config.num_hidden,
+                                       num_layers=1,
+                                       prefix=cell_prefix,
+                                       mode=config.cell_type,
+                                       bidirectional=bidirectional,
+                                       get_next_state=True,
+                                       dropout=config.dropout_inputs,
+                                       forget_bias=config.forget_bias)
+            rnn.add(ParallelInputFusedRNN(cell))
+
+    else:
+        rnn = mx.rnn.FusedRNNCell(config.num_hidden,
+                                  num_layers=config.num_layers,
+                                  prefix=prefix,
+                                  mode=config.cell_type,
+                                  bidirectional=bidirectional,
+                                  get_next_state=True,
+                                  dropout=config.dropout_inputs,
+                                  forget_bias=config.forget_bias)
+
     return rnn
 
 

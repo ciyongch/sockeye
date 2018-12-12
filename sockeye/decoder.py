@@ -525,13 +525,22 @@ class RecurrentDecoder(Decoder):
 
         # Stacked RNN
         if self.rnn_config.num_layers == 1 or not self.config.attention_in_upper_layers:
-            self.rnn_pre_attention = rnn.get_stacked_rnn(self.rnn_config, self.prefix, parallel_inputs=False)
+            if self.rnn_config.fused:
+                self.rnn_pre_attention = rnn.get_fused_rnn(self.rnn_config, self.prefix, parallel_inputs=False)
+            else:
+                self.rnn_pre_attention = rnn.get_stacked_rnn(self.rnn_config, self.prefix, parallel_inputs=False)
             self.rnn_post_attention = None
         else:
-            self.rnn_pre_attention = rnn.get_stacked_rnn(self.rnn_config, self.prefix, parallel_inputs=False,
-                                                         layers=[0])
-            self.rnn_post_attention = rnn.get_stacked_rnn(self.rnn_config, self.prefix, parallel_inputs=True,
-                                                          layers=range(1, self.rnn_config.num_layers))
+            if self.rnn_config.fused:
+                self.rnn_pre_attention = rnn.get_fused_rnn(self.rnn_config.copy(num_layers=1), self.prefix,
+                                                           parallel_inputs=False, layers=[0])
+                self.rnn_post_attention = rnn.get_fused_rnn(self.rnn_config, self.prefix, parallel_inputs=True,
+                                                            layers=range(1, self.rnn_config.num_layers))
+            else:
+                self.rnn_pre_attention = rnn.get_stacked_rnn(self.rnn_config, self.prefix, parallel_inputs=False,
+                                                             layers=[0])
+                self.rnn_post_attention = rnn.get_stacked_rnn(self.rnn_config, self.prefix, parallel_inputs=True,
+                                                              layers=range(1, self.rnn_config.num_layers))
         self.rnn_pre_attention_n_states = len(self.rnn_pre_attention.state_shape)
 
         if self.config.state_init != C.RNN_DEC_INIT_ZERO:
@@ -553,7 +562,8 @@ class RecurrentDecoder(Decoder):
         state_shapes = list(self.rnn_pre_attention.state_shape)
         if self.rnn_post_attention:
             state_shapes += self.rnn_post_attention.state_shape
-        for state_idx, (_, init_num_hidden) in enumerate(state_shapes):
+            logger.info('state_shapes, %s', state_shapes)
+        for state_idx in range(len(state_shapes)):
             self.init_ws.append(mx.sym.Variable("%senc2decinit_%d_weight" % (self.prefix, state_idx)))
             self.init_bs.append(mx.sym.Variable("%senc2decinit_%d_bias" % (self.prefix, state_idx)))
             if self.config.layer_normalization:
@@ -673,10 +683,15 @@ class RecurrentDecoder(Decoder):
         """
         self.rnn_pre_attention.reset()
         # Shallow copy of cells
-        cells_to_reset = list(self.rnn_pre_attention._cells)
+        cells_to_reset = []
+        if hasattr(self.rnn_pre_attention, "_cells"):
+            cells_to_reset += self.rnn_pre_attention._cells
+
         if self.rnn_post_attention:
             self.rnn_post_attention.reset()
-            cells_to_reset += self.rnn_post_attention._cells
+            if hasattr(self.rnn_post_attention, "_cells"):
+                cells_to_reset += self.rnn_post_attention._cells
+
         for cell in cells_to_reset:
             # TODO remove this once mxnet.rnn.ModifierCell.reset() invokes reset() of base_cell
             if isinstance(cell, mx.rnn.ModifierCell):
@@ -798,7 +813,9 @@ class RecurrentDecoder(Decoder):
 
         # initial states for each layer
         layer_states = []
-        for state_idx, (_, init_num_hidden) in enumerate(sum([rnn.state_shape for rnn in self.get_rnn_cells()], [])):
+
+        for state_idx, state_shape in enumerate(sum([rnn.state_shape for rnn in self.get_rnn_cells()], [])):
+            init_num_hidden = state_shape[-1]
             if self.config.state_init == C.RNN_DEC_INIT_ZERO:
                 init = mx.sym.tile(data=zeros, reps=(1, init_num_hidden))
             else:
@@ -854,8 +871,24 @@ class RecurrentDecoder(Decoder):
                                   name="%sconcat_target_context_t%d" % (self.prefix, seq_idx))
         # rnn_pre_attention_output: (batch_size, rnn_num_hidden)
         # rnn_pre_attention_layer_states: num_layers * [batch_size, rnn_num_hidden]
-        rnn_pre_attention_output, rnn_pre_attention_layer_states = \
-            self.rnn_pre_attention(rnn_input, state.layer_states[:self.rnn_pre_attention_n_states])
+        layer_states = []
+        if self.rnn_config.fused:
+            # (1, batch_size, rnn_num_hidden), TNC layout
+            rnn_input = mx.sym.expand_dims(rnn_input, axis=0)
+            for state in state.layer_states:
+                # (Layer, batch_size, rnn_num_hidden)
+                layer_states.append(mx.sym.expand_dims(state, axis=0))
+
+            rnn_pre_attention_output_3d, rnn_pre_attention_layer_states_3d = \
+                self.rnn_pre_attention.unroll(1, rnn_input, layer_states[:self.rnn_pre_attention_n_states], layout='TNC')
+            # (1, batch_size, rnn_num_hidden) -> (batch_size, rnn_num_hidden)
+            rnn_pre_attention_output = mx.sym.reshape(rnn_pre_attention_output_3d, shape=(-3, 0))
+            rnn_pre_attention_layer_states = []
+            for state in rnn_pre_attention_layer_states_3d:
+                rnn_pre_attention_layer_states.append(mx.sym.reshape(state, shape=(-3, 0)))
+        else:
+            rnn_pre_attention_output, rnn_pre_attention_layer_states = \
+                self.rnn_pre_attention(rnn_input, state.layer_states[:self.rnn_pre_attention_n_states])
 
         # (2) Attention step
         attention_input = self.attention.make_input(seq_idx, word_vec_prev, rnn_pre_attention_output)
@@ -863,9 +896,22 @@ class RecurrentDecoder(Decoder):
 
         # (3) Attention handling (and possibly context gating)
         if self.rnn_post_attention:
-            upper_rnn_output, upper_rnn_layer_states = \
-                self.rnn_post_attention(rnn_pre_attention_output, attention_state.context,
-                                        state.layer_states[self.rnn_pre_attention_n_states:])
+            if self.rnn_config.fused:
+                # (1, batch_size, rnn_num_hidden), TNC layout
+                context = mx.sym.expand_dims(attention_state.context, axis=0)
+                upper_rnn_output_3d, upper_rnn_layer_states_3d = \
+                    self.rnn_post_attention(rnn_pre_attention_output_3d, context,
+                                            layer_states[self.rnn_pre_attention_n_states:])
+                # (1, batch_size, rnn_num_hidden) -> (batch_size, rnn_num_hidden)
+                upper_rnn_output = mx.sym.reshape(upper_rnn_output_3d, shape=(-3, 0))
+                upper_rnn_layer_states = []
+                for state in upper_rnn_layer_states_3d:
+                    upper_rnn_layer_states.append(mx.sym.reshape(state, shape=(-3, 0)))
+            else:
+                upper_rnn_output, upper_rnn_layer_states = \
+                    self.rnn_post_attention(rnn_pre_attention_output, attention_state.context,
+                                            state.layer_states[self.rnn_pre_attention_n_states:])
+
             hidden_concat = mx.sym.concat(upper_rnn_output, attention_state.context,
                                           dim=1, name='%shidden_concat_t%d' % (self.prefix, seq_idx))
             if self.config.hidden_dropout > 0:
