@@ -885,7 +885,7 @@ class BiDirectionalFusedRNNEncoder(RecurrentEncoder):
                          prefix=prefix,
                          layout=layout)
         self.rnn_config = rnn_config.copy(num_hidden=rnn_config.num_hidden // 2)
-        self.rnn = rnn.get_fused_rnn(rnn_config, prefix, bidirectional=True)
+        self.rnn = rnn.get_fused_rnn(self.rnn_config, prefix, bidirectional=True)
 
 
 class BiDirectionalRNNEncoder(Encoder):

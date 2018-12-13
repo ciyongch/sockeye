@@ -562,7 +562,6 @@ class RecurrentDecoder(Decoder):
         state_shapes = list(self.rnn_pre_attention.state_shape)
         if self.rnn_post_attention:
             state_shapes += self.rnn_post_attention.state_shape
-            logger.info('state_shapes, %s', state_shapes)
         for state_idx in range(len(state_shapes)):
             self.init_ws.append(mx.sym.Variable("%senc2decinit_%d_weight" % (self.prefix, state_idx)))
             self.init_bs.append(mx.sym.Variable("%senc2decinit_%d_bias" % (self.prefix, state_idx)))
