@@ -765,8 +765,8 @@ class RecurrentDecoder(Decoder):
                                (batch_size, self.num_hidden),
                                layout="NC")] + \
                [mx.io.DataDesc("%senc2decinit_%d" % (self.prefix, i),
-                               (batch_size, num_hidden),
-                               layout=C.BATCH_MAJOR) for i, (_, num_hidden) in enumerate(
+                               (batch_size, state_shape[-1]),
+                               layout=C.BATCH_MAJOR) for i, state_shape in enumerate(
                    sum([rnn.state_shape for rnn in self.get_rnn_cells()], [])
                )]
 
