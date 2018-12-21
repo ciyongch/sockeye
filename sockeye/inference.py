@@ -468,7 +468,7 @@ def load_models(context: mx.context.Context,
         inference_model.initialize(max_input_len, get_max_output_length)
 
     load_time = time.time() - load_time_start
-    logger.info("%d model(s) loaded in %.4fs", len(models), load_time)
+    logger.info("%d model(s) loaded in %.4fs and built correctly", len(models), load_time)
     return models, source_vocabs[0], target_vocabs[0]
 
 
@@ -884,7 +884,7 @@ class ModelState:
         """
         Sorts states according to k-best order from last step in beam search.
         """
-        self.states = [mx.nd.take(ds, best_hyp_indices) for ds in self.states]
+        self.states[1:] = [mx.nd.take(ds, best_hyp_indices) for ds in self.states[1:]]
 
 
 class LengthPenalty(mx.gluon.HybridBlock):
@@ -1234,6 +1234,9 @@ class Translator:
                 batch_translations = batch_translations[:-rest]
             for chunk, translation in zip(batch, batch_translations):
                 translated_chunks.append(IndexedTranslation(chunk.input_idx, chunk.chunk_idx, translation))
+            print(batch_id);
+            if "ONE_BATCH_ONLY" in os.environ:
+                break
         # Sort by input idx and then chunk id
         translated_chunks = sorted(translated_chunks)
 
@@ -1429,11 +1432,11 @@ class Translator:
         # combine model predictions and convert to neg log probs
         if len(self.models) == 1:
             if self.skip_softmax:
-                neg_probs = -probs[0]
+                neg_probs = probs[0]
             else:
-                neg_probs = -mx.nd.log(probs[0])  # pylint: disable=invalid-unary-operand-type
+                neg_probs = mx.nd.log(probs[0])  # pylint: disable=invalid-unary-operand-type
         else:
-            neg_probs = self.interpolation_func(probs)
+            neg_probs = -self.interpolation_func(probs)
         return neg_probs, attention_prob_score
 
     def _beam_search(self,
@@ -1579,8 +1582,19 @@ class Translator:
 
             # (3) Get beam_size winning hypotheses for each sentence block separately. Only look as
             # far as the active beam size for each sentence.
-            best_hyp_indices, best_word_indices, scores_accumulated = self._top(scores)
+            first_beam_top_scores, first_beam_top_indices = mx.ndarray.topk(scores, axis=1, k=10, ret_typ='both', dtype='int32',is_ascend=True)
+            first_beam_top_scores_flattened=mx.ndarray.reshape(first_beam_top_scores,shape=(64,100))
+            second_beam_top_scores, second_beam_top_indices = mx.ndarray.topk(first_beam_top_scores_flattened, axis=1, k=10, ret_typ='both', dtype='int32',is_ascend=True)
+            offset=mx.ndarray.repeat(data=mx.nd.arange(0, 64* 100, 100, dtype='int32'),repeats=10,axis=0)
+            second_beam_top_indices=mx.ndarray.reshape(second_beam_top_indices,shape=-1)+offset;
+            offset = mx.ndarray.repeat(data=mx.nd.arange(0, 640 * 22666, 22666, dtype='int32'), repeats=10, axis=0)
+            first_beam_top_indices=mx.ndarray.reshape(first_beam_top_indices,shape=-1)+offset;
+            new_beam_top_indices=mx.ndarray.take(a=first_beam_top_indices,indices=second_beam_top_indices);
 
+            indices = mx.ndarray.reshape(new_beam_top_indices, shape=(-1,))
+            unraveled = mx.ndarray.unravel_index(indices, shape=(64 * 10, 22666))
+            best_hyp_indices, best_word_indices = mx.ndarray.split(unraveled, axis=0, num_outputs=2, squeeze_axis=True)
+            scores_accumulated = mx.ndarray.reshape(second_beam_top_scores, shape=(-1, 1))
             # Constraints for constrained decoding are processed sentence by sentence
             if any(raw_constraint_list):
                 best_hyp_indices, best_word_indices, scores_accumulated, \
@@ -1984,7 +1998,7 @@ class UpdateScores(mx.gluon.HybridBlock):
         # finished rows are inf everywhere except column zero (pad_id), which holds the accumulated model score.
         # Items that are finished (but not inactive) get their previous accumulated score for the <pad> symbol,
         # infinity otherwise.
-        scores = F.broadcast_add(scores, scores_accumulated)
+        scores = F.broadcast_sub(scores_accumulated,scores)
         # pylint: disable=invalid-sequence-index
         pad_id_scores = F.where(F.broadcast_logical_and(finished, F.logical_not(inactive)), scores_accumulated, inf_array)
         # pad_dist. Shape: (batch*beam, vocab_size)

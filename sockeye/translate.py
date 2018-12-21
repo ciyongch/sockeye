@@ -17,6 +17,8 @@ Translation CLI.
 import argparse
 import sys
 import time
+import os
+import mxnet as mx
 from contextlib import ExitStack
 from math import ceil
 from typing import Generator, Optional, List
@@ -213,9 +215,21 @@ def translate(output_handler: OutputHandler,
     :param translator: The translator that will be used for each line of input.
     :return: Total time taken.
     """
+
+    if "DO_SOCKEYE_PROFILING" in os.environ:
+        print("profiling start !!!!!!!!!!!!!")
+        mx.profiler.set_config(profile_symbolic=True, profile_imperative=True, profile_memory=False,
+                                 profile_api=False)
+        mx.profiler.set_state('run')
+
     tic = time.time()
     trans_outputs = translator.translate(trans_inputs)
     total_time = time.time() - tic
+    if "DO_SOCKEYE_PROFILING" in os.environ:
+        print("profiling end !")
+        mx.profiler.set_state('stop')
+        mx.profiler.dump();
+
     batch_time = total_time / len(trans_inputs)
     for trans_input, trans_output in zip(trans_inputs, trans_outputs):
         output_handler.handle(trans_input, trans_output, batch_time)
