@@ -76,8 +76,8 @@ class InferenceModel(model.SockeyeModel):
         self.beam_size = beam_size
         utils.check_condition(beam_size < self.config.vocab_target_size,
                               'The beam size must be smaller than the target vocabulary size.')
-        if skip_softmax:
-            assert beam_size == 1, 'Skipping softmax does not have any effect for beam size > 1'
+        # if skip_softmax:
+        #     assert beam_size == 1, 'Skipping softmax does not have any effect for beam size > 1'
         self.batch_size = batch_size
         self.softmax_temperature = softmax_temperature
         self.max_input_length, self.get_max_output_length = models_max_input_output_length([self],
@@ -409,7 +409,8 @@ def load_models(context: mx.context.Context,
         logger.info("Enabled skipping softmax for a single model and greedy decoding.")
     else:
         # but not for an ensemble or beam search
-        skip_softmax = False
+        # skip_softmax = False
+        skip_softmax = True
 
     for model_folder, checkpoint in zip(model_folders, checkpoints):
         model_source_vocabs = vocab.load_source_vocabs(model_folder)
@@ -1029,8 +1030,8 @@ class Translator:
         self.batch_size = self.models[0].batch_size
         # skip softmax for a single model, but not for an ensemble
         self.skip_softmax = self.models[0].skip_softmax
-        if self.skip_softmax:
-            utils.check_condition(len(self.models) == 1 and self.beam_size == 1, "Skipping softmax cannot be enabled for several models, or a beam size > 1.")
+        # if self.skip_softmax:
+        #     utils.check_condition(len(self.models) == 1 and self.beam_size == 1, "Skipping softmax cannot be enabled for several models, or a beam size > 1.")
 
         self.skip_topk = skip_topk
         # after models are loaded we ensured that they agree on max_input_length, max_output_length and batch size
@@ -1054,6 +1055,9 @@ class Translator:
         self._update_scores.initialize(ctx=self.context)
         self._update_scores.hybridize(static_alloc=True, static_shape=True)
 
+        self._topK_with_update_scores = TopK_with_UpdateScores(k=10,batch_size=64,vocab_size=len(self.vocab_target));
+        self._topK_with_update_scores.initialize(ctx=self.context);
+        self._topK_with_update_scores.hybridize(static_alloc=True,static_shape=True)
         # Vocabulary selection leads to different vocabulary sizes across requests. Hence, we cannot use a
         # statically-shaped HybridBlock for the topk operation in this case; resorting to imperative topk
         # function in this case.
@@ -1432,7 +1436,7 @@ class Translator:
         # combine model predictions and convert to neg log probs
         if len(self.models) == 1:
             if self.skip_softmax:
-                neg_probs = probs[0]
+                neg_probs = mx.nd.log_softmax(probs[0])
             else:
                 neg_probs = mx.nd.log(probs[0])  # pylint: disable=invalid-unary-operand-type
         else:
@@ -1572,7 +1576,7 @@ class Translator:
 
             # (2) Update scores. Special treatment for finished and inactive rows. Inactive rows are inf everywhere;
             # finished rows are inf everywhere except column zero, which holds the accumulated model score
-            scores = self._update_scores.forward(scores, finished, inactive, scores_accumulated, self.inf_array, pad_dist)
+            # scores = self._update_scores.forward(scores, finished, inactive, scores_accumulated, self.inf_array, pad_dist)
 
             # Mark entries that should be blocked as having a score of np.inf
             if self.global_avoid_trie or any(raw_avoid_list):
@@ -1582,20 +1586,11 @@ class Translator:
 
             # (3) Get beam_size winning hypotheses for each sentence block separately. Only look as
             # far as the active beam size for each sentence.
-            first_beam_top_scores, first_beam_top_indices = mx.ndarray.topk(scores, axis=1, k=10, ret_typ='both', dtype='int32',is_ascend=True)
-            first_beam_top_scores_flattened=mx.ndarray.reshape(first_beam_top_scores,shape=(64,100))
-            second_beam_top_scores, second_beam_top_indices = mx.ndarray.topk(first_beam_top_scores_flattened, axis=1, k=10, ret_typ='both', dtype='int32',is_ascend=True)
-            offset=mx.ndarray.repeat(data=mx.nd.arange(0, 64* 100, 100, dtype='int32'),repeats=10,axis=0)
-            second_beam_top_indices=mx.ndarray.reshape(second_beam_top_indices,shape=-1)+offset;
-            offset = mx.ndarray.repeat(data=mx.nd.arange(0, 640 * 22666, 22666, dtype='int32'), repeats=10, axis=0)
-            first_beam_top_indices=mx.ndarray.reshape(first_beam_top_indices,shape=-1)+offset;
-            new_beam_top_indices=mx.ndarray.take(a=first_beam_top_indices,indices=second_beam_top_indices);
 
-            indices = mx.ndarray.reshape(new_beam_top_indices, shape=(-1,))
-            unraveled = mx.ndarray.unravel_index(indices, shape=(64 * 10, 22666))
-            best_hyp_indices, best_word_indices = mx.ndarray.split(unraveled, axis=0, num_outputs=2, squeeze_axis=True)
-            scores_accumulated = mx.ndarray.reshape(second_beam_top_scores, shape=(-1, 1))
-            # Constraints for constrained decoding are processed sentence by sentence
+            best_hyp_indices, best_word_indices, scores_accumulated = self._topK_with_update_scores(scores,finished,inactive,scores_accumulated)
+
+            # best_hyp_indices, best_word_indices, scores_accumulated = self._top(scores)
+
             if any(raw_constraint_list):
                 best_hyp_indices, best_word_indices, scores_accumulated, \
                 constraints, inactive = constrained.topk(self.batch_size,
@@ -1887,6 +1882,10 @@ class TopK(mx.gluon.HybridBlock):
         with self.name_scope():
             offset = mx.nd.repeat(mx.nd.arange(0, batch_size * k, k, dtype='int32'), k)
             self.offset = self.params.get_constant(name='offset', value=offset)
+        second_beam_top_offset= mx.symbol.repeat(data=mx.symbol.arange(0, self.batch_size * k*k, k*k, dtype='int32'), repeats=k, axis=0)
+        self.second_beam_top_offset = second_beam_top_offset
+        first_beam_top_offset= mx.symbol.repeat(data=mx.symbol.arange(0, k*batch_size * vocab_size, vocab_size, dtype='int32'), repeats=k, axis=0)
+        self.first_beam_top_offset= first_beam_top_offset
 
     def hybrid_forward(self, F, scores, offset):
         """
@@ -1896,14 +1895,21 @@ class TopK(mx.gluon.HybridBlock):
         :param offset: Array to add to the hypothesis indices for offsetting in batch decoding.
         :return: The row indices, column indices and values of the k smallest items in matrix.
         """
-        folded_scores = F.reshape(scores, shape=(self.batch_size, self.k * self.vocab_size))
-        values, indices = F.topk(folded_scores, axis=1, k=self.k, ret_typ='both', is_ascend=True)
-        indices = F.reshape(F.cast(indices, 'int32'), shape=(-1,))
-        unraveled = F.unravel_index(indices, shape=(self.batch_size * self.k, self.vocab_size))
+        first_beam_top_scores, first_beam_top_indices = F.topk(scores, axis=1, k=self.k, ret_typ='both',
+                                                                        dtype='int32', is_ascend=True)
+        first_beam_top_scores_flattened = F.reshape(first_beam_top_scores, shape=(self.batch_size, self.k*self.k))
+        second_beam_top_scores, second_beam_top_indices = F.topk(first_beam_top_scores_flattened, axis=1, k=self.k,
+                                                                          ret_typ='both', dtype='int32', is_ascend=True)
+        second_beam_top_indices = F.reshape(second_beam_top_indices, shape=-1) + self.second_beam_top_offset;
+        first_beam_top_indices = F.reshape(first_beam_top_indices, shape=-1) + self.first_beam_top_offset;
+        new_beam_top_indices = F.take(a=first_beam_top_indices, indices=second_beam_top_indices);
+
+        indices = F.reshape(new_beam_top_indices, shape=(-1,))
+        unraveled = F.unravel_index(indices, shape=(self.batch_size* self.k, self.vocab_size))
         best_hyp_indices, best_word_indices = F.split(unraveled, axis=0, num_outputs=2, squeeze_axis=True)
-        best_hyp_indices = best_hyp_indices + offset
-        values = F.reshape(values, shape=(-1, 1))
-        return best_hyp_indices, best_word_indices, values
+        scores_accumulated = F.reshape(second_beam_top_scores, shape=(-1, 1))
+
+        return best_hyp_indices, best_word_indices, scores_accumulated
 
 
 class Top1(mx.gluon.HybridBlock):
@@ -2005,3 +2011,74 @@ class UpdateScores(mx.gluon.HybridBlock):
         pad_dist = F.concat(pad_id_scores, pad_dist)
         scores = F.where(F.broadcast_logical_or(finished, inactive), pad_dist, scores)
         return scores
+
+class TopK_with_UpdateScores(mx.gluon.HybridBlock):
+    """
+    A HybridBlock for a statically-shaped batch-wise topk operation.
+    """
+
+    def __init__(self, k: int, batch_size: int, vocab_size: int) -> None:
+        """
+        :param k: The number of smallest scores to return.
+        :param batch_size: Number of sentences being decoded at once.
+        :param vocab_size: Vocabulary size.
+        """
+        super().__init__()
+        self.k = k
+        self.batch_size = batch_size
+        self.vocab_size = vocab_size
+        assert C.PAD_ID == 0, "This blocks only works with PAD_ID == 0"
+
+        with self.name_scope():
+            offset = mx.nd.repeat(mx.nd.arange(0, batch_size * k, k, dtype='int32'), k)
+        second_beam_top_offset= mx.symbol.repeat(data=mx.symbol.arange(0, self.batch_size * k*k, k*k, dtype='int32'), repeats=k, axis=0)
+        self.second_beam_top_offset = second_beam_top_offset
+        first_beam_top_offset= mx.symbol.repeat(data=mx.symbol.arange(0, k*batch_size * vocab_size, vocab_size, dtype='int32'), repeats=k, axis=0)
+        self.first_beam_top_offset= first_beam_top_offset
+        self.inf_array_inactive=mx.symbol.full((self.batch_size*k,k),np.inf)
+        self.inf_array_2_finished=mx.symbol.full((self.batch_size*k,k-1),np.inf)
+
+        self.zero_array_finished=mx.symbol.full((self.batch_size*k,k),0,dtype='int32')
+
+    def hybrid_forward(self, F, scores,finished, inactive, scores_accumulated):
+        """
+        Get the lowest k elements per sentence from a `scores` matrix.
+
+        :param scores: Vocabulary scores for the next beam step. (batch_size * beam_size, target_vocabulary_size)
+        :param offset: Array to add to the hypothesis indices for offsetting in batch decoding.
+        :return: The row indices, column indices and values of the k smallest items in matrix.
+        """
+        first_beam_top_scores, first_beam_top_indices = F.topk(scores, axis=1, k=self.k, ret_typ='both',
+                                                                        dtype='int32', is_ascend=False)
+        #because we defer the sub to after the top, we actually want the most negative values, and not the top values
+        #that's why we use is_ascend=true
+
+        #by combining the update and the top k functionality, we can do the update on
+        #beam_size elements per beam instead of vocab size, reducing the operations by
+        #~2000x.
+
+        #fixing the scores by adding the prev beam scores
+        first_beam_top_scores = F.broadcast_sub(scores_accumulated,first_beam_top_scores)
+
+        #handling the inactive case
+        first_beam_top_scores = F.where(inactive, self.inf_array_inactive, first_beam_top_scores)
+
+        #handling the finished case
+        scores_accumulated_broadcast=F.concat(scores_accumulated,self.inf_array_2_finished)
+        first_beam_top_scores = F.where(finished, scores_accumulated_broadcast, first_beam_top_scores)
+        first_beam_top_indices = F.where(finished, self.zero_array_finished, first_beam_top_indices )
+
+        # print(first_beam_top_indices.debug_str());
+        first_beam_top_scores_flattened = F.reshape(first_beam_top_scores, shape=(self.batch_size, self.k*self.k))
+        second_beam_top_scores, second_beam_top_indices = F.topk(first_beam_top_scores_flattened, axis=1, k=self.k,
+                                                                          ret_typ='both', dtype='int32', is_ascend=True)
+        second_beam_top_indices = F.reshape(second_beam_top_indices, shape=-1) + self.second_beam_top_offset;
+        first_beam_top_indices = F.reshape(first_beam_top_indices, shape=-1) + self.first_beam_top_offset;
+        new_beam_top_indices = F.take(a=first_beam_top_indices, indices=second_beam_top_indices);
+
+        indices = F.reshape(new_beam_top_indices, shape=(-1,))
+        unraveled = F.unravel_index(indices, shape=(self.batch_size* self.k, self.vocab_size))
+        best_hyp_indices, best_word_indices = F.split(unraveled, axis=0, num_outputs=2, squeeze_axis=True)
+        scores_accumulated = F.reshape(second_beam_top_scores, shape=(-1, 1))
+        return best_hyp_indices, best_word_indices, scores_accumulated
+
